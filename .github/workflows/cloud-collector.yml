@@ -3,7 +3,7 @@ name: YanQiu public collector
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7 * * * *"
 
 permissions:
   contents: read
