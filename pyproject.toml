@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yanqiu-public-collector"
+version = "1.0.0"
+description = "Model-free public collection shell for YanQiu Zhice"
+requires-python = ">=3.11"
+dependencies = [
+  "libsql>=0.1",
+  "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+yanqiu-cloud-collect = "yanqiu_public.collector:main"
+yanqiu-cloud-probe = "yanqiu_public.connectivity:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["yanqiu_public*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
