@@ -113,6 +113,39 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _optional_text(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _canonical_event_row(row: tuple[object, ...]) -> tuple[object, ...]:
+    """Normalize local/libSQL scalar types before semantic comparison."""
+    return (
+        str(row[0]),
+        str(row[1]),
+        int(row[2]),
+        _optional_text(row[3]),
+        _optional_text(row[4]),
+        _optional_text(row[5]),
+        None if row[6] is None else float(row[6]),
+        str(row[7]),
+        int(row[8]),
+        _optional_text(row[9]),
+    )
+
+
+def _canonical_price_row(row: tuple[object, ...]) -> tuple[object, ...]:
+    """Normalize local/libSQL scalar types before semantic comparison."""
+    return (
+        str(row[0]),
+        str(row[1]),
+        int(row[2]),
+        str(row[3]),
+        str(row[4]),
+        float(row[5]),
+        str(row[6]),
+    )
+
+
 def _insert_rows_batched(
     con,
     insert_prefix: str,
@@ -215,7 +248,7 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
     captured = captured_at.astimezone(timezone.utc).isoformat()
     digest = hashlib.sha256(raw).hexdigest()
     event_payload = sorted(
-        (
+        _canonical_event_row((
             event.provider_match_id,
             event.issue_num,
             event.play_num,
@@ -226,11 +259,11 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
             _utc_iso(event.close_time),
             int(event.selling),
             event.final_score,
-        )
+        ))
         for event in events
     )
     price_payload = sorted(
-        (
+        _canonical_price_row((
             price.provider_match_id,
             price.issue_num,
             price.play_num,
@@ -238,36 +271,47 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
             price.selection,
             price.sp,
             price.price_kind,
-        )
+        ))
         for price in prices
     )
+    current_semantic_sha = _sha((event_payload, price_payload))
 
     con.execute("BEGIN IMMEDIATE")
     try:
         previous = con.execute(
-            """SELECT snapshot_id FROM source500_snapshots
+            """SELECT snapshot_id,content_sha256 FROM source500_snapshots
                WHERE issue_num=? AND market_type=?
                ORDER BY snapshot_id DESC LIMIT 1""",
             (issue, market),
         ).fetchone()
         if previous is not None:
             previous_id = int(previous[0])
-            previous_events = sorted(tuple(row) for row in con.execute(
+            if str(previous[1]) == digest:
+                con.commit()
+                _log(f"raw unchanged: {market}; reusing snapshot {previous_id}")
+                return previous_id
+            previous_events = sorted(_canonical_event_row(tuple(row)) for row in con.execute(
                 """SELECT provider_match_id,issue_num,play_num,competition,
                           home_team,away_team,handicap,close_time,selling,final_score
                    FROM source500_events WHERE snapshot_id=?""",
                 (previous_id,),
             ).fetchall())
-            previous_prices = sorted(tuple(row) for row in con.execute(
+            previous_prices = sorted(_canonical_price_row(tuple(row)) for row in con.execute(
                 """SELECT provider_match_id,issue_num,play_num,market_type,
                           selection,sp,price_kind
                    FROM source500_prices WHERE snapshot_id=?""",
                 (previous_id,),
             ).fetchall())
-            if previous_events == event_payload and previous_prices == price_payload:
+            previous_semantic_sha = _sha((previous_events, previous_prices))
+            if previous_semantic_sha == current_semantic_sha:
                 con.commit()
                 _log(f"semantic unchanged: {market}; reusing snapshot {previous_id}")
                 return previous_id
+            _log(
+                f"semantic changed: {market}; previous={previous_semantic_sha[:12]} "
+                f"current={current_semantic_sha[:12]} events={len(previous_events)}/{len(event_payload)} "
+                f"prices={len(previous_prices)}/{len(price_payload)}"
+            )
 
         stored_html = "gzip+base64:" + base64.b64encode(
             gzip.compress(raw, compresslevel=9, mtime=0)
