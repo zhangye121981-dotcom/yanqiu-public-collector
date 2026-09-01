@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import json
 import os
@@ -212,13 +214,68 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
         raise ValueError(f"{market} page contains mixed issues")
     captured = captured_at.astimezone(timezone.utc).isoformat()
     digest = hashlib.sha256(raw).hexdigest()
+    event_payload = sorted(
+        (
+            event.provider_match_id,
+            event.issue_num,
+            event.play_num,
+            event.competition,
+            event.home_team,
+            event.away_team,
+            event.handicap,
+            _utc_iso(event.close_time),
+            int(event.selling),
+            event.final_score,
+        )
+        for event in events
+    )
+    price_payload = sorted(
+        (
+            price.provider_match_id,
+            price.issue_num,
+            price.play_num,
+            price.market_type,
+            price.selection,
+            price.sp,
+            price.price_kind,
+        )
+        for price in prices
+    )
 
     con.execute("BEGIN IMMEDIATE")
     try:
+        previous = con.execute(
+            """SELECT snapshot_id FROM source500_snapshots
+               WHERE issue_num=? AND market_type=?
+               ORDER BY snapshot_id DESC LIMIT 1""",
+            (issue, market),
+        ).fetchone()
+        if previous is not None:
+            previous_id = int(previous[0])
+            previous_events = sorted(tuple(row) for row in con.execute(
+                """SELECT provider_match_id,issue_num,play_num,competition,
+                          home_team,away_team,handicap,close_time,selling,final_score
+                   FROM source500_events WHERE snapshot_id=?""",
+                (previous_id,),
+            ).fetchall())
+            previous_prices = sorted(tuple(row) for row in con.execute(
+                """SELECT provider_match_id,issue_num,play_num,market_type,
+                          selection,sp,price_kind
+                   FROM source500_prices WHERE snapshot_id=?""",
+                (previous_id,),
+            ).fetchall())
+            if previous_events == event_payload and previous_prices == price_payload:
+                con.commit()
+                _log(f"semantic unchanged: {market}; reusing snapshot {previous_id}")
+                return previous_id
+
+        stored_html = "gzip+base64:" + base64.b64encode(
+            gzip.compress(raw, compresslevel=9, mtime=0)
+        ).decode("ascii")
         con.execute(
             """INSERT OR IGNORE INTO source500_snapshots
                (issue_num,market_type,captured_at,content_sha256,html) VALUES(?,?,?,?,?)""",
-            (issue, market, captured, digest, raw),
+            (issue, market, captured, digest, stored_html),
         )
         row = con.execute(
             """SELECT snapshot_id FROM source500_snapshots
@@ -232,35 +289,8 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
             "SELECT count(*) FROM source500_events WHERE snapshot_id=?", (snapshot_id,)
         ).fetchone()[0])
         if existing == 0:
-            event_rows = [
-                    (
-                        snapshot_id,
-                        event.provider_match_id,
-                        event.issue_num,
-                        event.play_num,
-                        event.competition,
-                        event.home_team,
-                        event.away_team,
-                        event.handicap,
-                        _utc_iso(event.close_time),
-                        int(event.selling),
-                        event.final_score,
-                    )
-                    for event in events
-                ]
-            price_rows = [
-                    (
-                        snapshot_id,
-                        price.provider_match_id,
-                        price.issue_num,
-                        price.play_num,
-                        price.market_type,
-                        price.selection,
-                        price.sp,
-                        price.price_kind,
-                    )
-                    for price in prices
-                ]
+            event_rows = [(snapshot_id, *row) for row in event_payload]
+            price_rows = [(snapshot_id, *row) for row in price_payload]
             _insert_rows_batched(
                 con,
                 "INSERT INTO source500_events",
