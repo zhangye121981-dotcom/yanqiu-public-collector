@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -163,7 +165,7 @@ def ensure_schema(con) -> None:
     _log("remote schema ready")
 
 
-def fetch_current(market: str, timeout: float = 25.0) -> bytes:
+def fetch_current(market: str, timeout: float = 25.0, attempts: int = 3) -> bytes:
     request = Request(
         BASE_URL + PLAY_PAGES[market],
         headers={
@@ -171,8 +173,20 @@ def fetch_current(market: str, timeout: float = 25.0) -> bytes:
             "Accept": "text/html,application/xhtml+xml",
         },
     )
-    with urlopen(request, timeout=timeout) as response:
-        return response.read()
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except (URLError, TimeoutError, OSError) as exc:
+            if attempt >= attempts:
+                raise
+            delay = attempt * 2
+            _log(
+                f"fetch retry: {market} attempt={attempt + 1}/{attempts} "
+                f"after {type(exc).__name__}; waiting {delay}s"
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"{market} fetch retry loop ended unexpectedly")
 
 
 def adaptive_interval_seconds(source: str | bytes, market: str, now: datetime) -> int:
@@ -337,6 +351,8 @@ def main() -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if int(result["captured_markets"]) == 0:
         raise SystemExit(2)
+    if int(result["failed_markets"]) > 0:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
