@@ -16,7 +16,7 @@ jobs:
   collect:
     if: github.event_name == 'workflow_dispatch' || vars.COLLECTOR_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     env:
       TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
       TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
