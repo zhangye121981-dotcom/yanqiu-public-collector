@@ -1,0 +1,29 @@
+name: Cloud source connectivity smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install collector
+        run: python -m pip install .
+      - name: Probe all five public markets
+        run: python -m yanqiu_public.connectivity
+      - name: Save probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-connectivity-report
+          path: connectivity_report.json
+          retention-days: 7
