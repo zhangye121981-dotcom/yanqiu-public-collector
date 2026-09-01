@@ -109,6 +109,23 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _insert_rows_batched(
+    con,
+    insert_prefix: str,
+    rows: list[tuple[object, ...]],
+    *,
+    columns: int,
+    batch_size: int,
+) -> None:
+    """Insert many rows with a small number of remote database requests."""
+    row_placeholder = "(" + ",".join("?" for _ in range(columns)) + ")"
+    for offset in range(0, len(rows), batch_size):
+        batch = rows[offset:offset + batch_size]
+        placeholders = ",".join(row_placeholder for _ in batch)
+        parameters = tuple(value for row in batch for value in row)
+        con.execute(f"{insert_prefix} VALUES {placeholders}", parameters)
+
+
 def connect_remote():
     url = os.environ.get("TURSO_DATABASE_URL", "").strip()
     token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
@@ -201,9 +218,7 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
             "SELECT count(*) FROM source500_events WHERE snapshot_id=?", (snapshot_id,)
         ).fetchone()[0])
         if existing == 0:
-            con.executemany(
-                "INSERT INTO source500_events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                [
+            event_rows = [
                     (
                         snapshot_id,
                         event.provider_match_id,
@@ -218,11 +233,8 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
                         event.final_score,
                     )
                     for event in events
-                ],
-            )
-            con.executemany(
-                "INSERT INTO source500_prices VALUES(?,?,?,?,?,?,?,?)",
-                [
+                ]
+            price_rows = [
                     (
                         snapshot_id,
                         price.provider_match_id,
@@ -234,7 +246,20 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
                         price.price_kind,
                     )
                     for price in prices
-                ],
+                ]
+            _insert_rows_batched(
+                con,
+                "INSERT INTO source500_events",
+                event_rows,
+                columns=11,
+                batch_size=50,
+            )
+            _insert_rows_batched(
+                con,
+                "INSERT INTO source500_prices",
+                price_rows,
+                columns=8,
+                batch_size=100,
             )
             con.execute(
                 """INSERT OR IGNORE INTO forward_public_quotes
