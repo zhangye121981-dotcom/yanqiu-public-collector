@@ -14,6 +14,10 @@ BASE_URL = "https://trade.500.com"
 RESERVED_CLOUD_ID_FLOOR = 10_000_000
 
 
+def _log(message: str) -> None:
+    print(f"[collector] {message}", flush=True)
+
+
 SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS source500_snapshots(
       snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +120,21 @@ def connect_remote():
 
 
 def ensure_schema(con) -> None:
-    for statement in SCHEMA_STATEMENTS:
+    expected_objects = 13
+    _log("checking remote schema")
+    ready = con.execute(
+        """SELECT count(*) FROM sqlite_master WHERE name IN (
+        'source500_snapshots','source500_events','source500_prices',
+        'forward_public_quotes','forward_public_cycles','cloud_collection_runs',
+        'ix_source500_event','ix_source500_event_latest','ix_public_quotes_latest',
+        'cloud_runs_no_update','cloud_runs_no_delete',
+        'cloud_cycles_no_update','cloud_cycles_no_delete')"""
+    ).fetchone()
+    if ready is not None and int(ready[0]) == expected_objects:
+        _log("remote schema already ready; skipping DDL")
+        return
+    for index, statement in enumerate(SCHEMA_STATEMENTS, start=1):
+        _log(f"applying schema object {index}/{len(SCHEMA_STATEMENTS)}")
         con.execute(statement)
     for table in ("source500_snapshots", "forward_public_cycles", "cloud_collection_runs"):
         row = con.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchone()
@@ -125,6 +143,7 @@ def ensure_schema(con) -> None:
         elif int(row[0]) < RESERVED_CLOUD_ID_FLOOR - 1:
             con.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?", (RESERVED_CLOUD_ID_FLOOR - 1, table))
     con.commit()
+    _log("remote schema ready")
 
 
 def fetch_current(market: str, timeout: float = 25.0) -> bytes:
@@ -241,7 +260,9 @@ def capture_cycle(*, connect_fn=connect_remote, fetcher=fetch_current,
     captured_at = now or datetime.now(timezone.utc)
     if captured_at.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+    _log("connecting to Turso")
     con = connect_fn()
+    _log("connected to Turso")
     try:
         ensure_schema(con)
         completed: list[tuple[str, int]] = []
@@ -249,10 +270,15 @@ def capture_cycle(*, connect_fn=connect_remote, fetcher=fetch_current,
         intervals: list[int] = []
         for market in PLAY_PAGES:
             try:
+                _log(f"fetch start: {market}")
                 raw = fetcher(market)
+                _log(f"fetch complete: {market} ({len(raw)} bytes)")
                 intervals.append(adaptive_interval_seconds(raw, market, captured_at))
+                _log(f"ingest start: {market}")
                 completed.append((market, ingest_market(con, raw, market=market, captured_at=captured_at)))
+                _log(f"ingest complete: {market}")
             except Exception as exc:
+                _log(f"market failed: {market}: {type(exc).__name__}: {str(exc)[:200]}")
                 errors.append((market, type(exc).__name__, str(exc)[:300]))
         interval = min(intervals) if intervals else 1800
         evidence = _sha((captured_at.isoformat(), completed, errors, interval))
@@ -267,6 +293,7 @@ def capture_cycle(*, connect_fn=connect_remote, fetcher=fetch_current,
              json.dumps(completed, ensure_ascii=False), evidence),
         )
         con.commit()
+        _log(f"cycle committed: captured={len(completed)} failed={len(errors)}")
         return {
             "status": "completed" if not errors else "degraded",
             "captured_markets": len(completed),
