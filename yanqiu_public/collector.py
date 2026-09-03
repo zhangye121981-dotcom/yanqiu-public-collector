@@ -41,6 +41,7 @@ SCHEMA_STATEMENTS = (
       home_team TEXT,
       away_team TEXT,
       handicap REAL,
+      provider_event_time_text TEXT,
       close_time TEXT NOT NULL,
       selling INTEGER NOT NULL,
       final_score TEXT,
@@ -88,9 +89,19 @@ SCHEMA_STATEMENTS = (
       snapshot_ids_json TEXT NOT NULL,
       evidence_sha256 TEXT NOT NULL UNIQUE
     )""",
+    """CREATE TABLE IF NOT EXISTS source500_result_observations(
+      provider_match_id TEXT NOT NULL,
+      issue_num TEXT NOT NULL,
+      play_num INTEGER NOT NULL,
+      final_score TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      source_snapshot_id INTEGER NOT NULL REFERENCES source500_snapshots(snapshot_id),
+      PRIMARY KEY(provider_match_id,issue_num,play_num,final_score)
+    )""",
     "CREATE INDEX IF NOT EXISTS ix_source500_event ON source500_events(issue_num,play_num)",
     "CREATE INDEX IF NOT EXISTS ix_source500_event_latest ON source500_events(issue_num,play_num,snapshot_id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_public_quotes_latest ON forward_public_quotes(provider_odds_id,market_type,captured_at DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_source500_result_event ON source500_result_observations(issue_num,play_num,observed_at)",
     """CREATE TRIGGER IF NOT EXISTS cloud_runs_no_update BEFORE UPDATE ON cloud_collection_runs
        BEGIN SELECT RAISE(ABORT,'cloud collection runs are immutable'); END""",
     """CREATE TRIGGER IF NOT EXISTS cloud_runs_no_delete BEFORE DELETE ON cloud_collection_runs
@@ -99,6 +110,10 @@ SCHEMA_STATEMENTS = (
        BEGIN SELECT RAISE(ABORT,'public cycles are immutable'); END""",
     """CREATE TRIGGER IF NOT EXISTS cloud_cycles_no_delete BEFORE DELETE ON forward_public_cycles
        BEGIN SELECT RAISE(ABORT,'public cycles are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS source500_results_no_update BEFORE UPDATE ON source500_result_observations
+       BEGIN SELECT RAISE(ABORT,'source500 result observations are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS source500_results_no_delete BEFORE DELETE ON source500_result_observations
+       BEGIN SELECT RAISE(ABORT,'source500 result observations are immutable'); END""",
 )
 
 
@@ -127,9 +142,10 @@ def _canonical_event_row(row: tuple[object, ...]) -> tuple[object, ...]:
         _optional_text(row[4]),
         _optional_text(row[5]),
         None if row[6] is None else float(row[6]),
-        str(row[7]),
-        int(row[8]),
-        _optional_text(row[9]),
+        _optional_text(row[7]),
+        str(row[8]),
+        int(row[9]),
+        _optional_text(row[10]),
     )
 
 
@@ -174,7 +190,7 @@ def connect_remote():
 
 
 def ensure_schema(con) -> None:
-    expected_objects = 13
+    expected_objects = 17
     _log("checking remote schema")
     ready = con.execute(
         """SELECT count(*) FROM sqlite_master WHERE name IN (
@@ -182,14 +198,20 @@ def ensure_schema(con) -> None:
         'forward_public_quotes','forward_public_cycles','cloud_collection_runs',
         'ix_source500_event','ix_source500_event_latest','ix_public_quotes_latest',
         'cloud_runs_no_update','cloud_runs_no_delete',
-        'cloud_cycles_no_update','cloud_cycles_no_delete')"""
+        'cloud_cycles_no_update','cloud_cycles_no_delete',
+        'source500_result_observations','ix_source500_result_event',
+        'source500_results_no_update','source500_results_no_delete')"""
     ).fetchone()
     if ready is not None and int(ready[0]) == expected_objects:
-        _log("remote schema already ready; skipping DDL")
-        return
-    for index, statement in enumerate(SCHEMA_STATEMENTS, start=1):
-        _log(f"applying schema object {index}/{len(SCHEMA_STATEMENTS)}")
-        con.execute(statement)
+        _log("remote schema objects already ready")
+    else:
+        for index, statement in enumerate(SCHEMA_STATEMENTS, start=1):
+            _log(f"applying schema object {index}/{len(SCHEMA_STATEMENTS)}")
+            con.execute(statement)
+    event_columns = {str(row[1]) for row in con.execute("PRAGMA table_info(source500_events)")}
+    if "provider_event_time_text" not in event_columns:
+        _log("adding source500_events.provider_event_time_text")
+        con.execute("ALTER TABLE source500_events ADD COLUMN provider_event_time_text TEXT")
     for table in ("source500_snapshots", "forward_public_cycles", "cloud_collection_runs"):
         row = con.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchone()
         if row is None:
@@ -198,6 +220,35 @@ def ensure_schema(con) -> None:
             con.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?", (RESERVED_CLOUD_ID_FLOOR - 1, table))
     con.commit()
     _log("remote schema ready")
+
+
+def _record_result_observations(
+    con,
+    events,
+    *,
+    captured: str,
+    snapshot_id: int,
+) -> None:
+    rows = [
+        (
+            event.provider_match_id,
+            event.issue_num,
+            event.play_num,
+            event.final_score,
+            captured,
+            snapshot_id,
+        )
+        for event in events
+        if event.final_score
+    ]
+    if rows:
+        _insert_rows_batched(
+            con,
+            "INSERT OR IGNORE INTO source500_result_observations",
+            rows,
+            columns=6,
+            batch_size=100,
+        )
 
 
 def fetch_current(market: str, timeout: float = 25.0, attempts: int = 3) -> bytes:
@@ -256,6 +307,7 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
             event.home_team,
             event.away_team,
             event.handicap,
+            event.provider_event_time_text,
             _utc_iso(event.close_time),
             int(event.selling),
             event.final_score,
@@ -287,12 +339,16 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
         if previous is not None:
             previous_id = int(previous[0])
             if str(previous[1]) == digest:
+                _record_result_observations(
+                    con, events, captured=captured, snapshot_id=previous_id
+                )
                 con.commit()
                 _log(f"raw unchanged: {market}; reusing snapshot {previous_id}")
                 return previous_id
             previous_events = sorted(_canonical_event_row(tuple(row)) for row in con.execute(
                 """SELECT provider_match_id,issue_num,play_num,competition,
-                          home_team,away_team,handicap,close_time,selling,final_score
+                          home_team,away_team,handicap,provider_event_time_text,
+                          close_time,selling,final_score
                    FROM source500_events WHERE snapshot_id=?""",
                 (previous_id,),
             ).fetchall())
@@ -304,6 +360,9 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
             ).fetchall())
             previous_semantic_sha = _sha((previous_events, previous_prices))
             if previous_semantic_sha == current_semantic_sha:
+                _record_result_observations(
+                    con, events, captured=captured, snapshot_id=previous_id
+                )
                 con.commit()
                 _log(f"semantic unchanged: {market}; reusing snapshot {previous_id}")
                 return previous_id
@@ -339,7 +398,7 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
                 con,
                 "INSERT INTO source500_events",
                 event_rows,
-                columns=11,
+                columns=12,
                 batch_size=50,
             )
             _insert_rows_batched(
@@ -361,6 +420,9 @@ def ingest_market(con, raw: bytes, *, market: str, captured_at: datetime) -> int
                      AND e.selling=1 AND s.captured_at<e.close_time""",
                 (snapshot_id,),
             )
+        _record_result_observations(
+            con, events, captured=captured, snapshot_id=snapshot_id
+        )
         con.commit()
         return snapshot_id
     except Exception:
