@@ -28,6 +28,7 @@ class FiveHundredEvent:
     home_team: str
     away_team: str
     handicap: float
+    provider_event_time_text: str | None
     close_time: datetime
     selling: bool
     final_score: str | None
@@ -124,9 +125,19 @@ def parse_page(source: str | bytes, *, market_type: str) -> tuple[list[FiveHundr
         if handicap_text is None:
             handicap_text = cells[4] if market_type in {"rqspf", "correct_score"} else "0"
         event = FiveHundredEvent(
-            issue, play_num, row.get("fid", ""), meta.get("leagueName", cells[1]),
-            meta.get("homeTeam", cells[3]), meta.get("guestTeam", cells[5] if market_type in {"rqspf","correct_score"} else cells[4]),
-            float(str(handicap_text).replace("+", "")), close, selling, final_score,
+            issue_num=issue,
+            play_num=play_num,
+            provider_match_id=row.get("fid", ""),
+            competition=meta.get("leagueName", cells[1]),
+            home_team=meta.get("homeTeam", cells[3]),
+            away_team=meta.get(
+                "guestTeam", cells[5] if market_type in {"rqspf", "correct_score"} else cells[4]
+            ),
+            handicap=float(str(handicap_text).replace("+", "")),
+            provider_event_time_text=cells[2] or None,
+            close_time=close,
+            selling=selling,
+            final_score=final_score,
         )
         events.append(event)
         if selling and market_type != "correct_score":
